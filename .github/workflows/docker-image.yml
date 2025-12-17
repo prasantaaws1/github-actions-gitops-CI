@@ -1,0 +1,174 @@
+name: Node JS CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: write      # Need for commiting to CD repository if using GITHUB_TOKEN
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+
+jobs:
+  compile:
+    runs-on: node1
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node JS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '23'
+          
+      - name: Frontend Compilation ( Syntax Check )
+        run: |
+          cd client
+          find . -name "*.js" -exec node --check {} +
+
+      - name: Backend Compilation ( Syntax Check )
+        run: |
+          cd api
+          find . -name "*.js" -exec node --check {} +    
+
+  gitleaks-scan:
+    runs-on: node1
+    needs: compile
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: GitLeaks Setup
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Git Leaks Scan
+        run: |
+          gitleaks detect --source ./client --exit-code 1
+          gitleaks detect --source ./api --exit-code 1
+
+  trivy_fs_scan:
+    runs-on: node1
+    needs: gitleaks-scan
+    steps:
+      - name: Checkot Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+  build_backend_image_and_push:
+    runs-on: node1
+    needs: trivy_fs_scan
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Login to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ vars.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Setup QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Image & Push ( Backend )
+      uses: docker/build-push-action@v6
+      with:
+        context: ./api
+        file: ./api/Dockerfile
+        push: true
+        tags: |
+          beherapkb745/backend:latest
+          beherapkb745/backend:${{ env.IMAGE_TAG }}
+
+  build_frontend_image_and_push:
+    runs-on: node1
+    needs: trivy_fs_scan
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Login to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ vars.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Setup QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Image & Push ( Frontend )
+      uses: docker/build-push-action@v6
+      with:
+        context: ./client
+        file: ./client/Dockerfile
+        push: true
+        tags: |
+          beherapkb745/frontend:latest
+          beherapkb745/frontend:${{ env.IMAGE_TAG }}
+
+  trivy_image_scan:
+    runs-on: node1
+    needs: 
+    - build_backend_image_and_push
+    - build_frontend_image_and_push
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Run trivy image scan for backend
+      uses: aquasecurity/trivy-action@0.28.0
+      with:
+        scan-type: image
+        image-ref: beherapkb745/backend:${{ env.IMAGE_TAG }}
+        format: table
+        exit-code: '0'
+        ignore-unfixed: true
+        vuln-type: os,library
+        severity: HIGH,CRITICAL
+
+  update_cd_repo:
+    runs-on: node1
+    needs: trivy_image_scan
+    steps:
+      - name: Checkout CD Repo
+        uses: actions/checkout@v4
+        with:
+          repository: prasantaaws1/github-actions-gitops-CD
+          ref: main
+          token: ${{ secrets.CD_REPO_TOKEN }}
+          path: cd
+
+      - name: Bump images in manifests
+        working-directory: cd
+        run: |
+          curl -sL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o yq && sudo install yq /usr/local/bin/yq
+          yq -i '(.spec.template.spec.containers[] | select(.name=="backend")).image = "prasantaaws1/backend:" + strenv(IMAGE_TAG)' k8s-prod/backend.yaml
+          yq -i '(.spec.template.spec.containers[] | select(.name=="frontend")).image = "prasantaaws1/frontend:" + strenv(IMAGE_TAG)' k8s-prod/frontend.yaml
+
+      - name: Commit and push to CD repo
+        working-directory: cd
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "Bump images to ${IMAGE_TAG}" | echo "no changes"
+          git push
