@@ -12,6 +12,7 @@ permissions:
 
 env:
   IMAGE_TAG: ${{ github.sha }}
+  DOCKERHUB_USERNAME: 'beherapkb745'
 
 
 jobs:
@@ -78,7 +79,7 @@ jobs:
     - name: Login to DockerHub
       uses: docker/login-action@v3
       with:
-        username: ${{ vars.DOCKERHUB_USERNAME }}
+        username: ${{ env.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     - name: Setup QEMU
